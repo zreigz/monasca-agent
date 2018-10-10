@@ -14,6 +14,9 @@
 """Gather metrics on specific processes.
 
 """
+import os
+import sys
+
 from collections import defaultdict
 from collections import namedtuple
 
@@ -42,6 +45,12 @@ class ProcessCheck(checks.AgentCheck):
             self.log.debug('The path of the process filesystem set to %s', process_fs_path_config)
         else:
             self.log.debug('The process_fs_path not set. Use default path: /proc')
+
+        self._use_sudo = False
+        use_sudo_config = init_config.get('use_sudo', None)
+        if use_sudo_config:
+            self._use_sudo = use_sudo_config
+            self.log.debug('Execute some checks with sudo: %d', use_sudo_config)
 
         self._cached_processes = defaultdict(dict)
         self._current_process_list = None
@@ -121,28 +130,59 @@ class ProcessCheck(checks.AgentCheck):
                 else:
                     p.cpu_percent(interval=None)
 
-                # user might not have permission to call io_counters()
-                if io_permission:
-                    try:
-                        io_counters = p.io_counters()
+                if self._use_sudo:
+                    self.log.debug('Get I/O counters for process %d' % pid)
+                    euid = os.geteuid()
+                    fname = "/proc/%s/io" % pid
+                    fields = {}
+                    if euid != 0:
+                        args = ['sudo', sys.executable] + sys.argv + [os.environ]
+                        os.execlpe('sudo', *args)
+                    with open(fname, 'rb') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line:
+                                name, value = line.split(b': ')
+                                fields[name] = int(value)
+                    if fields:
                         total_read_count = self._safely_increment_var(
-                            total_read_count, io_counters.read_count)
+                            total_read_count, fields[b'syscr'])
                         total_write_count = self._safely_increment_var(
-                            total_write_count, io_counters.write_count)
+                            total_write_count, fields[b'syscw'])
                         total_read_kbytes = self._safely_increment_var(
-                            total_read_kbytes, float(io_counters.read_bytes / 1024))
+                            total_read_kbytes, float(fields[b'read_bytes'] / 1024))
                         total_write_kbytes = self._safely_increment_var(
-                            total_write_kbytes, float(io_counters.write_bytes / 1024))
-                    except psutil.AccessDenied:
-                        self.log.debug('monasca-agent user does not have ' +
-                                       'access to I/O counters for process' +
-                                       ' %d: %s'
-                                       % (pid, p.as_dict(['name'])['name']))
-                        io_permission = False
+                            total_write_kbytes, float(fields[b'write_bytes'] / 1024))
+                    else:
                         total_read_count = None
                         total_write_count = None
                         total_read_kbytes = None
                         total_write_kbytes = None
+                        self.log.debug('%s file was empty' % fname)
+
+                else:
+                    # user might not have permission to call io_counters()
+                    if io_permission:
+                        try:
+                            io_counters = p.io_counters()
+                            total_read_count = self._safely_increment_var(
+                                total_read_count, io_counters.read_count)
+                            total_write_count = self._safely_increment_var(
+                                total_write_count, io_counters.write_count)
+                            total_read_kbytes = self._safely_increment_var(
+                                total_read_kbytes, float(io_counters.read_bytes / 1024))
+                            total_write_kbytes = self._safely_increment_var(
+                                total_write_kbytes, float(io_counters.write_bytes / 1024))
+                        except psutil.AccessDenied:
+                            self.log.debug('monasca-agent user does not have ' +
+                                           'access to I/O counters for process' +
+                                           ' %d: %s'
+                                           % (pid, p.as_dict(['name'])['name']))
+                            io_permission = False
+                            total_read_count = None
+                            total_write_count = None
+                            total_read_kbytes = None
+                            total_write_kbytes = None
 
             # Skip processes dead in the meantime
             except psutil.NoSuchProcess:
